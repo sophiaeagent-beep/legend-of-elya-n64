@@ -1,0 +1,12 @@
+build/
+*.z64
+*.elf
+*.o
+filesystem/sophia_weights.bin
+filesystem/sophia_weights_v1_backup.bin
+filesystem/sophia_weights_v3.bin
+gen_sophia_host
+debug_gen
+__pycache__/
+*.pyc
+train_v3.log

@@ -66,7 +66,13 @@ static int16_t f16_to_fp_scale(uint16_t f16)
         /* inf/nan -> clamp */
         val = 65504.0f;
     } else {
-        val = (1.0f + frac / 1024.0f) * (float)(1 << (exp - 15));
+        float mantissa = 1.0f + frac / 1024.0f;
+        int e = (int)exp - 15;
+        if (e >= 0) {
+            val = mantissa * (float)(1u << (unsigned)e);
+        } else {
+            val = mantissa / (float)(1u << (unsigned)(-e));
+        }
     }
     if (sign) val = -val;
 

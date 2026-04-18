@@ -68,9 +68,9 @@ $(BUILD_DIR)/n64_attest.o: mining/n64/n64_attest.c
 	@mkdir -p $(BUILD_DIR)
 	$(CC) -c $(CFLAGS) -Imining/n64 -o $@ $<
 
-$(BUILD_DIR)/legend_of_elya_mining.o: legend_of_elya_mining.c
+$(BUILD_DIR)/legend_of_elya_mining.o: legend_of_elya.c
 	@mkdir -p $(BUILD_DIR)
-	$(CC) -c $(CFLAGS) -Imining/n64 -o $@ $<
+	$(CC) -c $(CFLAGS) -DUSE_MINING_PICO -Imining/n64 -o $@ $<
 
 $(BUILD_DIR)/legend_of_elya_mining.elf: $(BUILD_DIR)/legend_of_elya_mining.o $(BUILD_DIR)/nano_gpt.o $(BUILD_DIR)/n64_attest.o
 
@@ -88,11 +88,15 @@ $(BUILD_DIR)/n64_llm_rpc_mining.o: bridge/n64/n64_llm_rpc.c
 	@mkdir -p $(BUILD_DIR)
 	$(CC) -c $(CFLAGS) -DUSE_MINING -DUSE_RPC_LLM -Ibridge/n64 -Imining/n64 -o $@ $<
 
-$(BUILD_DIR)/legend_of_elya_rpc_mining.o: legend_of_elya_mining.c
+$(BUILD_DIR)/pak_io.o: bridge/n64/pak_io.c
 	@mkdir -p $(BUILD_DIR)
-	$(CC) -c $(CFLAGS) -DUSE_RPC_LLM -Imining/n64 -Ibridge/n64 -o $@ $<
+	$(CC) -c $(CFLAGS) -Ibridge/n64 -o $@ $<
 
-$(BUILD_DIR)/legend_of_elya_rpc_mining.elf: $(BUILD_DIR)/legend_of_elya_rpc_mining.o $(BUILD_DIR)/nano_gpt.o $(BUILD_DIR)/n64_attest.o $(BUILD_DIR)/n64_llm_rpc_mining.o
+$(BUILD_DIR)/legend_of_elya_rpc_mining.o: legend_of_elya.c
+	@mkdir -p $(BUILD_DIR)
+	$(CC) -c $(CFLAGS) -DUSE_MINING_PICO -DUSE_RPC_LLM -Imining/n64 -Ibridge/n64 -o $@ $<
+
+$(BUILD_DIR)/legend_of_elya_rpc_mining.elf: $(BUILD_DIR)/legend_of_elya_rpc_mining.o $(BUILD_DIR)/nano_gpt.o $(BUILD_DIR)/n64_attest.o $(BUILD_DIR)/n64_llm_rpc_mining.o $(BUILD_DIR)/pak_io.o
 
 legend_of_elya_rpc_mining.z64: N64_ROM_TITLE="Elya RPC Mine"
 legend_of_elya_rpc_mining.z64: $(BUILD_DIR)/legend_of_elya_rpc_mining.dfs

@@ -22,6 +22,10 @@
 #include "n64_llm_rpc.h"
 #endif
 
+#ifdef USE_MINING_PICO
+#include "n64_attest.h"
+#endif
+
 // ─── Room & NPC System ───────────────────────────────────────────────────────
 
 typedef enum {
@@ -143,7 +147,65 @@ typedef enum {
     STATE_GENERATING,
     STATE_KEYBOARD,      // Virtual keyboard for player text input
     STATE_ROOM_TRANSITION, // brief fade between rooms
+    STATE_GAMEOVER,      // Death / retry screen
+#ifdef USE_MINING_PICO
+    STATE_ATTEST,        // RustChain mining attestation (mining ROM only)
+#endif
 } GameState;
+
+// ─── Gameplay: player, enemies, pickups ──────────────────────────────────
+// Visible player hero roams rooms; NPCs (Sophia/Aldric/Brunhild) are fixed
+// per room. Enemies only spawn in combat rooms.
+#define PLAYER_X_MIN    12
+#define PLAYER_X_MAX    300
+#define PLAYER_Y_MIN    60
+#define PLAYER_Y_MAX    132
+#define PLAYER_SPEED    2
+#define PLAYER_IFRAMES  48
+#define SWING_FRAMES    20
+#define SWING_HIT_START 5
+#define SWING_HIT_END   14
+#define ATTACK_RANGE    32
+#define NPC_TALK_RANGE  34     // A near NPC within this radius opens dialog
+
+typedef enum {
+    FACE_DOWN  = 0,
+    FACE_UP    = 1,
+    FACE_LEFT  = 2,
+    FACE_RIGHT = 3,
+} Facing;
+
+typedef enum {
+    ENEMY_NONE    = 0,
+    ENEMY_STALFOS = 1,
+    ENEMY_KEESE   = 2,
+} EnemyKind;
+
+typedef struct {
+    int kind;
+    int x, y;
+    int hp, max_hp;
+    int hurt_timer;
+    int ai_timer;
+    int spawn_x, spawn_y;
+} Enemy;
+
+typedef enum {
+    PICKUP_NONE   = 0,
+    PICKUP_RUPEE  = 1,   // green +1
+    PICKUP_RUPEE5 = 2,   // blue  +5
+    PICKUP_HEART  = 3,   // +2 half-hearts
+} PickupKind;
+
+typedef struct {
+    int kind;
+    int x, y;
+    int vx, vy;
+    int life;
+} Pickup;
+
+#define MAX_ENEMIES 4
+#define MAX_PICKUPS 8
 
 // Forge spark particle (static pool, no alloc)
 #define MAX_SPARKS 12
@@ -213,6 +275,17 @@ typedef struct {
     int      rpc_pending;        // 1 = waiting for RPC response
     uint32_t rpc_send_us;        // timestamp when RPC request sent
 #endif
+    // ── Gameplay (ported from feature/gameplay-rooms-boss) ────────────────
+    int      player_face;          // Facing enum
+    int      player_iframes;       // invincibility frames remaining
+    int      swing_timer;          // 0 = idle, >0 = active swing frame counter
+    int      swing_hit_done;       // latches after first hit registers in window
+    int      rupees;
+    int      kills;
+    Enemy    enemies[MAX_ENEMIES];
+    Pickup   pickups[MAX_PICKUPS];
+    int      game_over_frame;
+    int      player_room_loaded;   // last room we spawned enemies for (-1 = fresh)
 } GameCtx;
 
 static GameCtx G;
@@ -595,6 +668,128 @@ static void draw_npc_sprite(const NPCProfile *npc, int f) {
     fillrect(sx+5, sy+3, 2, 2, RGBA32(20, 20, 80, 255));
 }
 
+// ─── Player hero sprite (distinct from NPCs — green tunic, sword + shield) ──
+
+static void draw_hero(int px, int py, int face, int swinging) {
+    /* Face directions: LEFT = right-hand side weapons flipped */
+    int face_left = (face == FACE_LEFT);
+    color_t tunic = RGBA32(30, 140,  60, 255);   // green
+    color_t trim  = RGBA32(180, 220, 110, 255);  // lighter green
+    color_t skin  = RGBA32(220, 180, 140, 255);
+    color_t hair  = RGBA32(200, 160,  40, 255);  // blonde
+    color_t boot  = RGBA32(80, 45, 20, 255);
+
+    /* Body centered on (px, py); head is above, boots below */
+    fillrect(px-5, py-8,   10, 9, skin);       // face/head base
+    fillrect(px-6, py-10,  12, 4, hair);       // hair
+    fillrect(px-5, py-2,    2, 2, RGBA32(20,20,80,255));  // eyes (simple dots)
+    fillrect(px+3, py-2,    2, 2, RGBA32(20,20,80,255));
+    fillrect(px-6, py+1,   12, 11, tunic);    // tunic top
+    fillrect(px-6, py+1,   12, 2,  trim);     // collar trim
+    fillrect(px-6, py+12,  12, 4,  boot);     // belt / trousers line
+    fillrect(px-5, py+14,   4, 4,  boot);     // left boot
+    fillrect(px+1, py+14,   4, 4,  boot);     // right boot
+
+    /* Shield + sword positions follow facing */
+    int sh_off = face_left ? +7 : -12;
+    int sw_off = face_left ? -10 : 7;
+
+    /* Shield (small kite) */
+    {
+        int shx = px + sh_off, shy = py + 2;
+        fillrect(shx,   shy,    6, 8, RGBA32(40, 70, 180, 255));
+        fillrect(shx,   shy,    6, 1, RGBA32(215,175,0, 255));
+        fillrect(shx,   shy+8,  4, 2, RGBA32(40, 70, 180, 255));
+        fillrect(shx+1, shy+3,  4, 3, RGBA32(80,220,255, 255));  // gem
+    }
+
+    /* Sword — swing rotates 0 → forward, then back to rest */
+    {
+        int swx = px + sw_off;
+        int tilt = 0;
+        if (swinging) {
+            int prog = SWING_FRAMES - swinging;  // 0..19
+            tilt = (prog < 10) ? prog * 2 : (20 - prog) * 2;
+        }
+        int blade_y = py - 10 + tilt;
+        fillrect(swx,   blade_y,    2, 14, RGBA32(195,215,235, 255));
+        fillrect(swx,   blade_y-1,  2, 1,  RGBA32(240,250,255, 255));
+        fillrect(swx-2, py+2,       6, 2,  RGBA32(215,175,0, 255));   // crossguard
+        fillrect(swx,   py+4,       2, 4,  RGBA32(110, 60, 15, 255)); // grip
+    }
+}
+
+static void draw_stalfos(int ex, int ey, int flash) {
+    fillrect(ex-4, ey,     12, 10, RGBA32(220,220,200,255));
+    fillrect(ex-2, ey+2,    3,  3, RGBA32(8,4,16,255));
+    fillrect(ex+4, ey+2,    3,  3, RGBA32(8,4,16,255));
+    fillrect(ex-3, ey+10,  10,  4, RGBA32(200,200,180,255));
+    fillrect(ex-5, ey+14,  14, 16, RGBA32(180,180,160,255));
+    for (int r = 0; r < 3; r++)
+        fillrect(ex-5, ey+15+r*5, 14, 2, RGBA32(70,70,55,255));
+    fillrect(ex-4, ey+30,   4, 14, RGBA32(180,180,160,255));
+    fillrect(ex+4, ey+30,   4, 14, RGBA32(180,180,160,255));
+    if (flash) fillrect(ex-5, ey, 14, 44, RGBA32(255, 255, 255, 200));
+}
+
+static void draw_keese(int kx, int ky, int wing, int flash) {
+    fillrect(kx-3, ky-2, 6, 5, RGBA32(25, 15, 35, 255));
+    if (wing == 0) {
+        fillrect(kx-12, ky-5,  9, 6, RGBA32(50, 35, 70, 255));
+        fillrect(kx+3,  ky-5,  9, 6, RGBA32(50, 35, 70, 255));
+        fillrect(kx-12, ky-1,  4, 3, RGBA32(35, 22, 50, 255));
+        fillrect(kx+8,  ky-1,  4, 3, RGBA32(35, 22, 50, 255));
+    } else {
+        fillrect(kx-12, ky+1,  9, 5, RGBA32(50, 35, 70, 255));
+        fillrect(kx+3,  ky+1,  9, 5, RGBA32(50, 35, 70, 255));
+        fillrect(kx-10, ky-2,  4, 3, RGBA32(35, 22, 50, 255));
+        fillrect(kx+6,  ky-2,  4, 3, RGBA32(35, 22, 50, 255));
+    }
+    fillrect(kx-1, ky-1, 2, 2, RGBA32(255, 60,  20, 255));
+    fillrect(kx+2, ky-1, 2, 2, RGBA32(255, 60,  20, 255));
+    if (flash) fillrect(kx-12, ky-5, 25, 13, RGBA32(255, 255, 255, 200));
+}
+
+static void draw_pickup(const Pickup *p, int f) {
+    int twinkle = (f / 6) & 1;
+    switch (p->kind) {
+        case PICKUP_RUPEE: {
+            color_t base = RGBA32( 60, 200, 110, 255);
+            color_t hi   = RGBA32(180, 255, 200, 255);
+            fillrect(p->x-1, p->y-4, 2, 2, base);
+            fillrect(p->x-2, p->y-2, 4, 2, base);
+            fillrect(p->x-3, p->y,   6, 2, base);
+            fillrect(p->x-2, p->y+2, 4, 2, base);
+            fillrect(p->x-1, p->y+4, 2, 2, base);
+            if (twinkle) fillrect(p->x, p->y-2, 1, 2, hi);
+            break;
+        }
+        case PICKUP_RUPEE5: {
+            color_t base = RGBA32( 60, 140, 255, 255);
+            color_t hi   = RGBA32(180, 220, 255, 255);
+            fillrect(p->x-1, p->y-5, 3, 2, base);
+            fillrect(p->x-3, p->y-3, 7, 2, base);
+            fillrect(p->x-4, p->y-1, 9, 2, base);
+            fillrect(p->x-3, p->y+1, 7, 2, base);
+            fillrect(p->x-1, p->y+3, 3, 2, base);
+            if (twinkle) fillrect(p->x, p->y-3, 1, 3, hi);
+            break;
+        }
+        case PICKUP_HEART: {
+            color_t red = RGBA32(230,  50,  50, 255);
+            color_t hi  = RGBA32(255, 180, 180, 255);
+            fillrect(p->x-3, p->y-3, 2, 2, red);
+            fillrect(p->x+1, p->y-3, 2, 2, red);
+            fillrect(p->x-4, p->y-1, 8, 3, red);
+            fillrect(p->x-3, p->y+2, 6, 1, red);
+            fillrect(p->x-2, p->y+3, 4, 1, red);
+            fillrect(p->x-1, p->y+4, 2, 1, red);
+            if (twinkle) fillrect(p->x-2, p->y-2, 1, 1, hi);
+            break;
+        }
+    }
+}
+
 // ─── Room-specific scene elements ────────────────────────────────────────────
 
 static void draw_room_walls_floor(RoomID room) {
@@ -807,94 +1002,86 @@ static void scene_dungeon(void) {
         }
     }
 
-    // Dungeon-only enemies and combat
+    // Treasure chest (dungeon decor — kept from original)
     if (room == ROOM_DUNGEON) {
-        int sx = 204, sy = 72 + (int)(sinf(f * 0.08f) * 2.0f);
+        int cx = 146, cy = 112;
+        fillrect(cx,    cy+10, 28, 20, RGBA32(100, 62, 18, 255));
+        fillrect(cx,    cy,    28, 12, RGBA32(130, 82, 28, 255));
+        fillrect(cx+2,  cy-1,  24,  2, RGBA32(155, 100, 40, 255));
+        fillrect(cx,    cy+10, 28,  2, RGBA32(215, 175,  0, 255));
+        fillrect(cx,    cy+28, 28,  2, RGBA32(215, 175,  0, 255));
+        fillrect(cx,    cy,    28,  2, RGBA32(215, 175,  0, 255));
+        fillrect(cx,    cy,     2, 30, RGBA32(215, 175,  0, 255));
+        fillrect(cx+26, cy,     2, 30, RGBA32(215, 175,  0, 255));
+        fillrect(cx+11, cy+8,   6,  6, RGBA32(215, 175,  0, 255));
+        fillrect(cx+13, cy+9,   2,  2, RGBA32(30,  20,   5, 255));
+        fillrect(cx+13, cy+11,  2,  3, RGBA32(30,  20,   5, 255));
+        int glow = ((f / 30) & 1) ? 60 : 20;
+        fillrect(cx+3,  cy+3,   8,  2, RGBA32(255, 230, 100, glow));
+        fillrect(cx+14, cy+3,   8,  2, RGBA32(255, 230, 100, glow));
+    }
 
-        // Stalfos skeleton (left side)
-        int ex = 80, ey = 78;
-        fillrect(ex-4, ey,     12, 10, RGBA32(220,220,200,255));
-        fillrect(ex-2, ey+2,    3,  3, RGBA32(8,4,16,255));
-        fillrect(ex+4, ey+2,    3,  3, RGBA32(8,4,16,255));
-        fillrect(ex-3, ey+10,  10,  4, RGBA32(200,200,180,255));
-        fillrect(ex-5, ey+14,  14, 16, RGBA32(180,180,160,255));
-        for (int r = 0; r < 3; r++)
-            fillrect(ex-5, ey+15+r*5, 14, 2, RGBA32(70,70,55,255));
-        fillrect(ex-4, ey+30,   4, 14, RGBA32(180,180,160,255));
-        fillrect(ex+4, ey+30,   4, 14, RGBA32(180,180,160,255));
-        if (atk > 0 && atk <= 22 && G.attack_target == 0)
-            fillrect(ex-5, ey, 14, 44, RGBA32(255, 255, 255, 200));
-
-        // Keese (bat enemy)
+    // ── Enemies (dynamic, via G.enemies[]) ─────────────────────────────────
+    {
         int wing = (f / 5) & 1;
-        fillrect(kx-3, ky-2, 6, 5, RGBA32(25, 15, 35, 255));
-        if (wing == 0) {
-            fillrect(kx-12, ky-5,  9, 6, RGBA32(50, 35, 70, 255));
-            fillrect(kx+3,  ky-5,  9, 6, RGBA32(50, 35, 70, 255));
-            fillrect(kx-12, ky-1,  4, 3, RGBA32(35, 22, 50, 255));
-            fillrect(kx+8,  ky-1,  4, 3, RGBA32(35, 22, 50, 255));
-        } else {
-            fillrect(kx-12, ky+1,  9, 5, RGBA32(50, 35, 70, 255));
-            fillrect(kx+3,  ky+1,  9, 5, RGBA32(50, 35, 70, 255));
-            fillrect(kx-10, ky-2,  4, 3, RGBA32(35, 22, 50, 255));
-            fillrect(kx+6,  ky-2,  4, 3, RGBA32(35, 22, 50, 255));
+        for (int i = 0; i < MAX_ENEMIES; i++) {
+            const Enemy *e = &G.enemies[i];
+            if (e->kind == ENEMY_NONE || e->hp <= 0) continue;
+            int flash = (e->hurt_timer > 0);
+            if (e->kind == ENEMY_STALFOS) draw_stalfos(e->x, e->y - 22, flash);
+            else if (e->kind == ENEMY_KEESE) draw_keese(e->x, e->y, wing, flash);
         }
-        fillrect(kx-1, ky-1, 2, 2, RGBA32(255, 60,  20, 255));
-        fillrect(kx+2, ky-1, 2, 2, RGBA32(255, 60,  20, 255));
-        if (atk > 0 && atk <= 22 && G.attack_target == 1)
-            fillrect(kx-12, ky-5, 25, 13, RGBA32(255, 255, 255, 200));
+    }
 
-        // Treasure Chest
-        {
-            int cx = 146, cy = 112;
-            fillrect(cx,    cy+10, 28, 20, RGBA32(100, 62, 18, 255));
-            fillrect(cx,    cy,    28, 12, RGBA32(130, 82, 28, 255));
-            fillrect(cx+2,  cy-1,  24,  2, RGBA32(155, 100, 40, 255));
-            fillrect(cx,    cy+10, 28,  2, RGBA32(215, 175,  0, 255));
-            fillrect(cx,    cy+28, 28,  2, RGBA32(215, 175,  0, 255));
-            fillrect(cx,    cy,    28,  2, RGBA32(215, 175,  0, 255));
-            fillrect(cx,    cy,     2, 30, RGBA32(215, 175,  0, 255));
-            fillrect(cx+26, cy,     2, 30, RGBA32(215, 175,  0, 255));
-            fillrect(cx+11, cy+8,   6,  6, RGBA32(215, 175,  0, 255));
-            fillrect(cx+13, cy+9,   2,  2, RGBA32(30,  20,   5, 255));
-            fillrect(cx+13, cy+11,  2,  3, RGBA32(30,  20,   5, 255));
-            int glow = ((f / 30) & 1) ? 60 : 20;
-            fillrect(cx+3,  cy+3,   8,  2, RGBA32(255, 230, 100, glow));
-            fillrect(cx+14, cy+3,   8,  2, RGBA32(255, 230, 100, glow));
+    // ── Pickups ────────────────────────────────────────────────────────────
+    for (int i = 0; i < MAX_PICKUPS; i++) {
+        if (G.pickups[i].kind != PICKUP_NONE) draw_pickup(&G.pickups[i], f);
+    }
+
+    // ── Player hero ────────────────────────────────────────────────────────
+    {
+        int hide = (G.player_iframes > 0) && ((f >> 1) & 1);
+        if (!hide) {
+            draw_hero(G.player_x, G.player_y, G.player_face, G.swing_timer);
         }
+    }
 
-        // Attack slash trail
-        if (atk > 22) {
-            int prog = 42 - atk;
-            int swx_tip = sx + 14, swy_tip = sy - 14;
-            int tx = (G.attack_target == 0) ? ex + 1 : kx;
-            int ty = (G.attack_target == 0) ? ey + 4 : ky;
-            int lx = swx_tip + ((tx - swx_tip) * prog) / 19;
-            int ly = swy_tip + ((ty - swy_tip) * prog) / 19;
+    // ── Swing trail (directional, from player position) ────────────────────
+    if (G.swing_timer > 0) {
+        int prog = SWING_FRAMES - G.swing_timer;
+        int tip_x = G.player_x, tip_y = G.player_y - 10;
+        int fwd_x = G.player_x, fwd_y = G.player_y;
+        switch (G.player_face) {
+            case FACE_UP:    fwd_x = G.player_x;      fwd_y = G.player_y - 26; break;
+            case FACE_DOWN:  fwd_x = G.player_x;      fwd_y = G.player_y + 26; break;
+            case FACE_LEFT:  fwd_x = G.player_x - 26; fwd_y = G.player_y;      break;
+            case FACE_RIGHT: fwd_x = G.player_x + 26; fwd_y = G.player_y;      break;
+        }
+        int denom = SWING_FRAMES - 1;
+        int lx = tip_x + ((fwd_x - tip_x) * prog) / denom;
+        int ly = tip_y + ((fwd_y - tip_y) * prog) / denom;
+        if (prog <= 14) {
             fillrect(lx-2, ly-2, 6, 6, RGBA32(255, 255, 120, 255));
             fillrect(lx-1, ly-1, 4, 4, RGBA32(255, 240, 60,  255));
-            if (prog > 2) {
-                int lx2 = swx_tip + ((tx - swx_tip) * (prog - 3)) / 19;
-                int ly2 = swy_tip + ((ty - swy_tip) * (prog - 3)) / 19;
-                fillrect(lx2-1, ly2-1, 4, 4, RGBA32(220, 200, 40, 180));
-            }
-            if (prog > 5) {
-                int lx3 = swx_tip + ((tx - swx_tip) * (prog - 6)) / 19;
-                int ly3 = swy_tip + ((ty - swy_tip) * (prog - 6)) / 19;
-                fillrect(lx3,   ly3,   2, 2, RGBA32(180, 140, 20, 120));
-            }
-        } else if (atk > 0) {
-            int hx2 = (G.attack_target == 0) ? ex + 1 : kx;
-            int hy2 = (G.attack_target == 0) ? ey + 4 : ky;
-            int sp  = 22 - atk;
-            fillrect(hx2 + sp,     hy2 - sp/2, 3, 3, RGBA32(255, 230,   0, 255));
-            fillrect(hx2 - sp,     hy2 + sp/2, 3, 3, RGBA32(255, 200,  50, 255));
-            fillrect(hx2 + sp/2,   hy2 + sp,   3, 3, RGBA32(255, 160,   0, 255));
-            fillrect(hx2 - sp/2,   hy2 - sp,   3, 3, RGBA32(255, 100,   0, 255));
-            if (sp < 9)
-                fillrect(hx2 - 3, hy2 - 3, 7, 7, RGBA32(255, 255, 200, 255));
+        } else {
+            fillrect(lx-1, ly-1, 3, 3, RGBA32(180, 140, 20, 120));
         }
-    } // end ROOM_DUNGEON enemies
+    }
+
+    // ── Hit-flash sparks at wounded enemies ────────────────────────────────
+    for (int i = 0; i < MAX_ENEMIES; i++) {
+        const Enemy *e = &G.enemies[i];
+        if (e->kind == ENEMY_NONE || e->hurt_timer <= 0) continue;
+        int sp = 12 - e->hurt_timer;
+        if (sp < 0) sp = 0;
+        int hx2 = e->x, hy2 = e->y - (e->kind == ENEMY_STALFOS ? 10 : 0);
+        fillrect(hx2 + sp, hy2 - sp/2, 3, 3, RGBA32(255, 230,  0, 255));
+        fillrect(hx2 - sp, hy2 + sp/2, 3, 3, RGBA32(255, 200, 50, 255));
+        if (sp < 5) fillrect(hx2 - 3, hy2 - 3, 7, 7, RGBA32(255, 255, 200, 255));
+    }
+
+    /* Suppress unused-var warnings for legacy atk / kx / ky removed from this path */
+    (void)atk; (void)kx; (void)ky;
 
     // ── Room exit indicators (arrows at edges) ─────────────────────────────
     {
@@ -1252,16 +1439,59 @@ static void draw_text(surface_t *disp) {
         graphics_draw_text(disp, 104, 170, "the dungeon...");
         break;
 
-    case STATE_DUNGEON:
+    case STATE_DUNGEON: {
         // Room name in HUD (right of magic bar)
         graphics_draw_text(disp, 60, 3, ROOM_NAMES[G.current_room]);
         graphics_draw_text(disp, 186, 3,  "MP");   // magic bar label
-        // Context-sensitive help text
-        if (G.current_room == ROOM_DUNGEON)
-            graphics_draw_text(disp,  10, 220, "[A]Talk [B]Keyboard  (auto-attack)");
+        // Rupee + kills counter bottom-left
+        {
+            char buf[32];
+            int r = G.rupees; if (r > 999) r = 999;
+            int k2 = G.kills; if (k2 > 99) k2 = 99;
+            buf[0]='R'; buf[1]=':';
+            buf[2]='0' + (r / 100) % 10;
+            buf[3]='0' + (r /  10) % 10;
+            buf[4]='0' +  r        % 10;
+            buf[5]=' '; buf[6]='K'; buf[7]=':';
+            buf[8]='0' + (k2 / 10) % 10;
+            buf[9]='0' +  k2       % 10;
+            buf[10]='\0';
+            graphics_draw_text(disp, 10, 220, buf);
+        }
+        // Context-sensitive hint (alternates)
+        if ((G.frame / 180) & 1)
+            graphics_draw_text(disp, 100, 220, "[stick]Move [A]Attack/Talk [B]Type");
+        else if (G.current_room == ROOM_DUNGEON)
+            graphics_draw_text(disp, 100, 220, "Slay foes for rupees.");
         else
-            graphics_draw_text(disp, 10, 220, "[A]Talk [B]Keyboard [L/R]Move");
+            graphics_draw_text(disp, 100, 220, "Walk to Sophia and press A to talk.");
         break;
+    }
+
+    case STATE_GAMEOVER: {
+        int since = G.frame - G.game_over_frame;
+        graphics_draw_text(disp, 112, 60, "* GAME OVER *");
+        graphics_draw_text(disp,  92, 82, "The dungeon claims you...");
+        char rbuf[24], kbuf[16];
+        int r = G.rupees; if (r > 999) r = 999;
+        int k2 = G.kills; if (k2 > 99) k2 = 99;
+        rbuf[0]='R'; rbuf[1]='u'; rbuf[2]='p'; rbuf[3]='e';
+        rbuf[4]='e'; rbuf[5]='s'; rbuf[6]=':'; rbuf[7]=' ';
+        rbuf[8]  = '0' + (r / 100) % 10;
+        rbuf[9]  = '0' + (r /  10) % 10;
+        rbuf[10] = '0' +  r        % 10;
+        rbuf[11] = '\0';
+        graphics_draw_text(disp, 112, 108, rbuf);
+        kbuf[0]='K'; kbuf[1]='i'; kbuf[2]='l'; kbuf[3]='l';
+        kbuf[4]='s'; kbuf[5]=':'; kbuf[6]=' ';
+        kbuf[7] = '0' + (k2 / 10) % 10;
+        kbuf[8] = '0' +  k2       % 10;
+        kbuf[9] = '\0';
+        graphics_draw_text(disp, 112, 122, kbuf);
+        if (since > 60 && ((G.frame / 30) & 1))
+            graphics_draw_text(disp, 80, 170, "Press START to try again");
+        break;
+    }
 
     case STATE_DIALOG_SELECT: {
         // Room name in HUD
@@ -1411,6 +1641,11 @@ static void draw_text(surface_t *disp) {
             graphics_draw_text(disp, 20, 220, "[A] Next  [B] Close");
         break;
     }
+#ifdef USE_MINING_PICO
+    case STATE_ATTEST:
+        /* Attest screen draws its own text via attest_draw_text() in main loop */
+        break;
+#endif
     }
 }
 
@@ -1563,6 +1798,228 @@ static void update_generating_step(void) {
     }
 }
 
+// ─── Gameplay helpers (combat + pickups + room spawning) ───────────────────
+
+static inline int iabs(int a) { return a < 0 ? -a : a; }
+
+static int find_enemy_in_range(int x, int y, int range) {
+    int best = -1;
+    int best_d2 = range * range;
+    for (int i = 0; i < MAX_ENEMIES; i++) {
+        if (G.enemies[i].kind == ENEMY_NONE || G.enemies[i].hp <= 0) continue;
+        int dx = G.enemies[i].x - x;
+        int dy = G.enemies[i].y - y;
+        int d2 = dx*dx + dy*dy;
+        if (d2 < best_d2) { best_d2 = d2; best = i; }
+    }
+    return best;
+}
+
+/* NPC in current room, if within talk range of the player. */
+static int npc_in_talk_range(void) {
+    int idx = G.current_npc;
+    if (idx < 0 || idx >= NPC_COUNT) return -1;
+    int nx = NPC_PROFILES[idx].sprite_x;
+    int ny = NPC_PROFILES[idx].sprite_y_base + 8;  /* center-ish */
+    int dx = nx - G.player_x;
+    int dy = ny - G.player_y;
+    if (dx*dx + dy*dy <= NPC_TALK_RANGE * NPC_TALK_RANGE) return idx;
+    return -1;
+}
+
+static void spawn_pickup(int x, int y, int kind) {
+    for (int i = 0; i < MAX_PICKUPS; i++) {
+        if (G.pickups[i].kind == PICKUP_NONE) {
+            uint32_t e = (uint32_t)TICKS_READ() ^ (uint32_t)(i * 0x9E37u);
+            G.pickups[i].kind = kind;
+            G.pickups[i].x = x;
+            G.pickups[i].y = y;
+            G.pickups[i].vx = ((int)(e & 0x7) - 3);
+            G.pickups[i].vy = -4 - (int)((e >> 4) & 0x3);
+            G.pickups[i].life = 300;
+            return;
+        }
+    }
+}
+
+static void spawn_enemy_at(int slot, int kind, int x, int y) {
+    G.enemies[slot].kind       = kind;
+    G.enemies[slot].x          = x;
+    G.enemies[slot].y          = y;
+    G.enemies[slot].spawn_x    = x;
+    G.enemies[slot].spawn_y    = y;
+    G.enemies[slot].hurt_timer = 0;
+    G.enemies[slot].ai_timer   = 0;
+    if (kind == ENEMY_STALFOS) {
+        G.enemies[slot].hp = G.enemies[slot].max_hp = 3;
+    } else if (kind == ENEMY_KEESE) {
+        G.enemies[slot].hp = G.enemies[slot].max_hp = 1;
+    } else {
+        G.enemies[slot].hp = G.enemies[slot].max_hp = 0;
+    }
+}
+
+/* Populate enemies[] based on room. Library + Forge are peaceful. */
+static void spawn_enemies_for_room(RoomID room) {
+    memset(G.enemies, 0, sizeof(G.enemies));
+    memset(G.pickups, 0, sizeof(G.pickups));
+    if (room == ROOM_DUNGEON) {
+        spawn_enemy_at(0, ENEMY_STALFOS,  80,  95);
+        spawn_enemy_at(1, ENEMY_STALFOS,  52, 120);
+        spawn_enemy_at(2, ENEMY_KEESE,   140,  55);
+        spawn_enemy_at(3, ENEMY_KEESE,   200,  70);
+    }
+    G.player_room_loaded = (int)room;
+}
+
+static void reset_gameplay(void) {
+    G.player_x        = 160;
+    G.player_y        = 120;
+    G.player_face     = FACE_DOWN;
+    G.player_iframes  = 0;
+    G.swing_timer     = 0;
+    G.swing_hit_done  = 0;
+    G.hearts          = 8;
+    G.magic           = 128;
+    G.rupees          = 0;
+    G.kills           = 0;
+    G.game_over_frame = 0;
+    G.current_room    = ROOM_DUNGEON;
+    G.current_npc     = 0;
+    G.player_room_loaded = -1;
+    spawn_enemies_for_room(ROOM_DUNGEON);
+}
+
+static void damage_player(int half_hearts) {
+    if (G.player_iframes > 0) return;
+    G.hearts -= half_hearts;
+    if (G.hearts < 0) G.hearts = 0;
+    G.player_iframes = PLAYER_IFRAMES;
+    if (G.hearts == 0) {
+        G.state = STATE_GAMEOVER;
+        G.game_over_frame = G.frame;
+    }
+}
+
+static void hit_enemy(int idx) {
+    Enemy *e = &G.enemies[idx];
+    if (e->hp <= 0) return;
+    e->hp--;
+    e->hurt_timer = 12;
+    if (e->hp <= 0) {
+        uint32_t r = (uint32_t)TICKS_READ() ^ (uint32_t)(idx * 0x45D9F3B1u);
+        int drop = PICKUP_RUPEE;
+        if (e->kind == ENEMY_STALFOS && (r & 0x3) == 0)       drop = PICKUP_RUPEE5;
+        else if (e->kind == ENEMY_STALFOS && (r & 0xF) == 1)  drop = PICKUP_HEART;
+        spawn_pickup(e->x, e->y, drop);
+        G.kills++;
+        e->kind = ENEMY_NONE;
+    }
+}
+
+static void update_enemies(void) {
+    for (int i = 0; i < MAX_ENEMIES; i++) {
+        Enemy *e = &G.enemies[i];
+        if (e->kind == ENEMY_NONE || e->hp <= 0) continue;
+        if (e->hurt_timer > 0) e->hurt_timer--;
+        e->ai_timer++;
+
+        if (e->kind == ENEMY_STALFOS) {
+            int dx = G.player_x - e->x;
+            int dy = G.player_y - e->y;
+            int d2 = dx*dx + dy*dy;
+            if (d2 < 80*80 && (e->ai_timer & 1)) {
+                if (dx >  1) e->x += 1;
+                else if (dx < -1) e->x -= 1;
+                if (dy >  1) e->y += 1;
+                else if (dy < -1) e->y -= 1;
+            } else if ((e->ai_timer / 30) & 1) {
+                if (e->x < e->spawn_x + 12) e->x += (e->ai_timer & 1);
+                else if (e->x > e->spawn_x - 12) e->x -= (e->ai_timer & 1);
+            }
+            if (e->y < PLAYER_Y_MIN) e->y = PLAYER_Y_MIN;
+            if (e->y > PLAYER_Y_MAX) e->y = PLAYER_Y_MAX;
+        } else if (e->kind == ENEMY_KEESE) {
+            if ((e->ai_timer % 90) < 30) {
+                int dx = G.player_x - e->x;
+                int dy = G.player_y - e->y;
+                if (dx >  1) e->x += 2;
+                else if (dx < -1) e->x -= 2;
+                if (dy >  1) e->y += 1;
+                else if (dy < -1) e->y -= 1;
+            } else {
+                e->x = e->spawn_x + (int)(sinf(e->ai_timer * 0.05f) * 40.0f);
+                e->y = 55 + (int)(sinf(e->ai_timer * 0.08f) * 14.0f);
+            }
+        }
+
+        /* Contact damage */
+        int cdx = G.player_x - e->x;
+        int cdy = G.player_y - e->y;
+        if (iabs(cdx) < 18 && iabs(cdy) < 20) damage_player(1);
+    }
+}
+
+static void update_pickups(void) {
+    for (int i = 0; i < MAX_PICKUPS; i++) {
+        Pickup *p = &G.pickups[i];
+        if (p->kind == PICKUP_NONE) continue;
+        p->x  += p->vx;
+        p->y  += p->vy;
+        p->vy += 1;
+        if (p->y > 140) { p->y = 140; p->vy = 0; p->vx = 0; }
+        p->life--;
+        if (p->life <= 0) { p->kind = PICKUP_NONE; continue; }
+        int dx = p->x - G.player_x;
+        int dy = p->y - G.player_y;
+        if (iabs(dx) < 14 && iabs(dy) < 18) {
+            switch (p->kind) {
+                case PICKUP_RUPEE:  G.rupees += 1; break;
+                case PICKUP_RUPEE5: G.rupees += 5; break;
+                case PICKUP_HEART:
+                    G.hearts += 2;
+                    if (G.hearts > 8) G.hearts = 8;
+                    break;
+            }
+            p->kind = PICKUP_NONE;
+        }
+    }
+}
+
+static void resolve_swing_hit(void) {
+    if (G.swing_timer <= 0) return;
+    int prog = SWING_FRAMES - G.swing_timer;
+    if (prog < SWING_HIT_START || prog > SWING_HIT_END) return;
+    if (G.swing_hit_done) return;
+    int hx = G.player_x, hy = G.player_y;
+    switch (G.player_face) {
+        case FACE_UP:    hy -= 22; break;
+        case FACE_DOWN:  hy += 22; break;
+        case FACE_LEFT:  hx -= 22; break;
+        case FACE_RIGHT: hx += 22; break;
+    }
+    int idx = find_enemy_in_range(hx, hy, 22);
+    if (idx >= 0) { hit_enemy(idx); G.swing_hit_done = 1; }
+}
+
+static void update_world(void) {
+    /* Sync room spawn (new room load brings fresh enemies/pickups) */
+    if (G.player_room_loaded != (int)G.current_room
+        && G.state != STATE_ROOM_TRANSITION) {
+        spawn_enemies_for_room(G.current_room);
+    }
+    if (G.state != STATE_DUNGEON) return;
+    if (G.player_iframes > 0) G.player_iframes--;
+    if (G.swing_timer > 0) {
+        resolve_swing_hit();
+        G.swing_timer--;
+        if (G.swing_timer == 0) G.swing_hit_done = 0;
+    }
+    update_enemies();
+    update_pickups();
+    if ((G.frame & 7) == 0 && G.magic < 128) G.magic++;
+}
+
 // ─── Dialog logic ─────────────────────────────────────────────────────────────
 
 /* Open the dialog option selector (D-pad menu) */
@@ -1655,28 +2112,82 @@ static void handle_input(void) {
     case STATE_TITLE:
         if (k.c[0].start || k.c[0].A) G.state = STATE_DUNGEON;
         break;
-    case STATE_DUNGEON:
-        if (k.c[0].A) start_dialog();
+    case STATE_DUNGEON: {
+        struct controller_data held = get_keys_held();
+
+        /* ── Movement: analog stick + d-pad (all 4 dirs) ──────────────── */
+        int mx = 0, my = 0;
+        if (held.c[0].left)  mx -= PLAYER_SPEED;
+        if (held.c[0].right) mx += PLAYER_SPEED;
+        if (held.c[0].up)    my -= PLAYER_SPEED;
+        if (held.c[0].down)  my += PLAYER_SPEED;
+        int ax = held.c[0].x, ay = held.c[0].y;
+        if (ax >  32) mx =  PLAYER_SPEED + (ax > 60 ? 1 : 0);
+        if (ax < -32) mx = -PLAYER_SPEED - (ax < -60 ? 1 : 0);
+        if (ay >  32) my = -PLAYER_SPEED - (ay > 60 ? 1 : 0);
+        if (ay < -32) my =  PLAYER_SPEED + (ay < -60 ? 1 : 0);
+        if (G.swing_timer > 0) { mx = 0; my = 0; }
+
+        if (mx || my) {
+            G.player_x += mx;
+            G.player_y += my;
+            if (iabs(mx) >= iabs(my)) G.player_face = (mx < 0) ? FACE_LEFT : FACE_RIGHT;
+            else                      G.player_face = (my < 0) ? FACE_UP   : FACE_DOWN;
+        }
+
+        /* ── Edge-triggered room transitions ─────────────────────────── */
+        {
+            const RoomExits *ex = &ROOM_MAP[G.current_room];
+            if (G.player_x <= PLAYER_X_MIN && ex->west >= 0) {
+                begin_room_transition((RoomID)ex->west);
+                G.player_x = PLAYER_X_MAX - 8;   /* enter opposite edge */
+            } else if (G.player_x >= PLAYER_X_MAX && ex->east >= 0) {
+                begin_room_transition((RoomID)ex->east);
+                G.player_x = PLAYER_X_MIN + 8;
+            } else {
+                if (G.player_x < PLAYER_X_MIN) G.player_x = PLAYER_X_MIN;
+                if (G.player_x > PLAYER_X_MAX) G.player_x = PLAYER_X_MAX;
+            }
+            if (G.player_y < PLAYER_Y_MIN) G.player_y = PLAYER_Y_MIN;
+            if (G.player_y > PLAYER_Y_MAX) G.player_y = PLAYER_Y_MAX;
+
+            /* L/R shoulders as quick-transition fallback */
+            if (k.c[0].L && ex->west >= 0) begin_room_transition((RoomID)ex->west);
+            if (k.c[0].R && ex->east >= 0) begin_room_transition((RoomID)ex->east);
+        }
+
+        /* ── A: context-sensitive (enemy → attack, NPC → talk) ────────── */
+        if (k.c[0].A) {
+            int tgt = find_enemy_in_range(G.player_x, G.player_y, ATTACK_RANGE);
+            if (tgt >= 0 && G.swing_timer == 0) {
+                int dx = G.enemies[tgt].x - G.player_x;
+                int dy = G.enemies[tgt].y - G.player_y;
+                if (iabs(dx) >= iabs(dy)) G.player_face = (dx < 0) ? FACE_LEFT : FACE_RIGHT;
+                else                      G.player_face = (dy < 0) ? FACE_UP   : FACE_DOWN;
+                G.swing_timer = SWING_FRAMES;
+                G.swing_hit_done = 0;
+                G.attack_timer   = 42;   /* drive legacy hit-flash */
+                G.attack_target  = (G.enemies[tgt].kind == ENEMY_KEESE) ? 1 : 0;
+            } else if (npc_in_talk_range() >= 0) {
+                start_dialog();   /* opens dialog_select for current NPC */
+            }
+        }
         if (k.c[0].B) {
+#ifdef USE_MINING_PICO
+            /* Mining ROM: B opens attestation mining screen */
+            attest_start();
+            G.state = STATE_ATTEST;
+#else
+            /* Base ROM: B opens virtual keyboard for typed prompt */
             G.state = STATE_KEYBOARD;
             G.kb_row = 0; G.kb_col = 0;
             G.kb_len = 0; G.kb_debounce = 10;
             memset(G.kb_input, 0, sizeof(G.kb_input));
+#endif
         }
-        /* Room transitions via L/R shoulder buttons */
-        {
-            const RoomExits *ex = &ROOM_MAP[G.current_room];
-            if (k.c[0].L && ex->west >= 0)
-                begin_room_transition((RoomID)ex->west);
-            if (k.c[0].R && ex->east >= 0)
-                begin_room_transition((RoomID)ex->east);
-            /* D-pad left/right also transition rooms (natural movement) */
-            if (k.c[0].left && ex->west >= 0)
-                begin_room_transition((RoomID)ex->west);
-            if (k.c[0].right && ex->east >= 0)
-                begin_room_transition((RoomID)ex->east);
-        }
+        if (k.c[0].Z) G.perf_show = !G.perf_show;
         break;
+    }
     case STATE_DIALOG_SELECT:
         /* D-pad up/down to navigate options */
         if (k.c[0].up)
@@ -1706,6 +2217,18 @@ static void handle_input(void) {
         break;
     case STATE_GENERATING:
         break;
+    case STATE_GAMEOVER:
+        if (G.frame - G.game_over_frame > 60 && (k.c[0].start || k.c[0].A)) {
+            reset_gameplay();
+            G.state = STATE_DUNGEON;
+        }
+        break;
+#ifdef USE_MINING_PICO
+    case STATE_ATTEST:
+        /* attest_handle_input returns 0 when user exits the screen */
+        if (!attest_handle_input(&k)) G.state = STATE_DUNGEON;
+        break;
+#endif
     }
 }
 
@@ -1730,13 +2253,8 @@ static void game_init(void) {
     }
 #endif
 
-    G.hearts = 8;    // 4 full hearts
-    G.magic  = 128;  // full magic bar
-    G.current_room = ROOM_DUNGEON;
-    G.current_npc  = 0;  // Sophia
+    reset_gameplay();   /* hearts, magic, room, enemies, player pos+face */
     G.dialog_select_idx = 0;
-    G.player_x = 160;
-    G.player_y = 120;
 
     int fd = dfs_open("/sophia_weights.bin");
     if (fd >= 0) {
@@ -1799,6 +2317,15 @@ int main(void) {
         if (G.state == STATE_GENERATING)
             update_generating_step();
 
+#ifdef USE_MINING_PICO
+        if (G.state == STATE_ATTEST)
+            attest_update(G.frame);
+#endif
+
+        // Per-frame gameplay (movement applied in handle_input; this
+        // advances enemy AI, collisions, pickups, swing hit-window, regen).
+        update_world();
+
         // Get ONE surface for this frame
         surface_t *disp = display_get();
 
@@ -1814,6 +2341,15 @@ int main(void) {
             fillrect(30, 130, 260, 6, RGBA32(180, 140, 0, 255));
         } else if (G.state == STATE_KEYBOARD) {
             scene_keyboard();
+#ifdef USE_MINING_PICO
+        } else if (G.state == STATE_ATTEST) {
+            attest_draw_scene(G.frame);
+#endif
+        } else if (G.state == STATE_GAMEOVER) {
+            int since = G.frame - G.game_over_frame;
+            int alpha = since * 4; if (alpha > 220) alpha = 220;
+            fillrect(0, 0, 320, 240, RGBA32(0, 0, 0, 255));
+            fillrect(0, 40, 320, 120, RGBA32(80, 0, 0, alpha));
         } else {
             scene_dungeon();
             if (G.state == STATE_DIALOG_SELECT)
@@ -1829,6 +2365,11 @@ int main(void) {
 
         // ── CPU text pass (same surface, no buffer switch → no flicker) ───
         draw_text(disp);
+
+#ifdef USE_MINING_PICO
+        if (G.state == STATE_ATTEST)
+            attest_draw_text(disp);
+#endif
 
         display_show(disp);
 

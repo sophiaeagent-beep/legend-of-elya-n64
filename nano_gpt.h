@@ -3,34 +3,34 @@
 #include <libdragon.h>
 
 // Sophia Elya AI - World's First N64 LLM
-// nano-GPT: 2 layers, 128 embedding, 4 heads, vocab=256, ctx=32
+// nano-GPT: 4 layers, 128 embedding, 4 heads, vocab=256, ctx=64 (v5 weights)
 // RSP-accelerated matrix multiply via DMA tiling
 
 #define SGAI_MAGIC      0x53454149  // "SEAI"
-#define SGAI_N_LAYERS   2
+#define SGAI_N_LAYERS   4
 #define SGAI_N_EMBED    128
 #define SGAI_N_HEADS    4
 #define SGAI_HEAD_DIM   (SGAI_N_EMBED / SGAI_N_HEADS)  // 32
 #define SGAI_VOCAB      256
-#define SGAI_CTX        32
-#define SGAI_Q4_BLOCK   32  // weight quantization block size
+#define SGAI_CTX        64
+#define SGAI_Q_BLOCK    32  // weight quantization block size
 
-// Weight layout for one attention layer
+// Weight layout for one attention layer (Q8: int8 weights, float16 scales)
 typedef struct {
-    // Q4 packed weights (2 weights per byte) + float16 scales (per 32-block)
-    uint8_t wq[SGAI_N_EMBED * SGAI_N_EMBED / 2];   // Query projection
-    uint8_t wk[SGAI_N_EMBED * SGAI_N_EMBED / 2];   // Key
-    uint8_t wv[SGAI_N_EMBED * SGAI_N_EMBED / 2];   // Value
-    uint8_t wo[SGAI_N_EMBED * SGAI_N_EMBED / 2];   // Output
-    uint8_t wff1[SGAI_N_EMBED * SGAI_N_EMBED * 4 / 2];  // FFN expand (128->512)
-    uint8_t wff2[SGAI_N_EMBED * SGAI_N_EMBED * 4 / 2];  // FFN contract (512->128)
-    // Q4 scale factors (float16, one per 32-weight block)
-    uint16_t sq[SGAI_N_EMBED * SGAI_N_EMBED / SGAI_Q4_BLOCK];
-    uint16_t sk[SGAI_N_EMBED * SGAI_N_EMBED / SGAI_Q4_BLOCK];
-    uint16_t sv[SGAI_N_EMBED * SGAI_N_EMBED / SGAI_Q4_BLOCK];
-    uint16_t so[SGAI_N_EMBED * SGAI_N_EMBED / SGAI_Q4_BLOCK];
-    uint16_t sff1[(SGAI_N_EMBED * SGAI_N_EMBED * 4) / SGAI_Q4_BLOCK];
-    uint16_t sff2[(SGAI_N_EMBED * SGAI_N_EMBED * 4) / SGAI_Q4_BLOCK];
+    // Q8 packed weights (1 weight per byte, signed int8) + float16 scales (per 32-block)
+    int8_t wq[SGAI_N_EMBED * SGAI_N_EMBED];        // Query projection
+    int8_t wk[SGAI_N_EMBED * SGAI_N_EMBED];        // Key
+    int8_t wv[SGAI_N_EMBED * SGAI_N_EMBED];        // Value
+    int8_t wo[SGAI_N_EMBED * SGAI_N_EMBED];        // Output
+    int8_t wff1[SGAI_N_EMBED * SGAI_N_EMBED * 4]; // FFN expand (128->512)
+    int8_t wff2[SGAI_N_EMBED * SGAI_N_EMBED * 4]; // FFN contract (512->128)
+    // Q8 scale factors (float16, one per 32-weight block)
+    uint16_t sq[SGAI_N_EMBED * SGAI_N_EMBED / SGAI_Q_BLOCK];
+    uint16_t sk[SGAI_N_EMBED * SGAI_N_EMBED / SGAI_Q_BLOCK];
+    uint16_t sv[SGAI_N_EMBED * SGAI_N_EMBED / SGAI_Q_BLOCK];
+    uint16_t so[SGAI_N_EMBED * SGAI_N_EMBED / SGAI_Q_BLOCK];
+    uint16_t sff1[(SGAI_N_EMBED * SGAI_N_EMBED * 4) / SGAI_Q_BLOCK];
+    uint16_t sff2[(SGAI_N_EMBED * SGAI_N_EMBED * 4) / SGAI_Q_BLOCK];
 } __attribute__((aligned(8))) SGAILayer;
 
 typedef struct {
@@ -40,15 +40,15 @@ typedef struct {
     uint8_t n_heads;
     uint16_t vocab_size;
     uint8_t ctx_len;
-    uint8_t pad[1];
-    // After header: embedding table (vocab * embed, Q4 packed)
+    uint8_t em_scale_x16;  // embedding scale * 16 (e.g., 56 = 3.5)
+    // After header: embedding table (vocab * embed bytes, Q8 int8)
     // Then n_layers SGAILayer structs
 } __attribute__((packed)) SGAIHeader;
 
 // KV cache for inference (in RDRAM)
 typedef struct {
-    int16_t k[SGAI_N_LAYERS][SGAI_CTX][SGAI_N_EMBED];  // Fixed-point Q8
-    int16_t v[SGAI_N_LAYERS][SGAI_CTX][SGAI_N_EMBED];
+    float k[SGAI_N_LAYERS][SGAI_CTX][SGAI_N_EMBED];
+    float v[SGAI_N_LAYERS][SGAI_CTX][SGAI_N_EMBED];
     int pos;
 } __attribute__((aligned(8))) SGAIKVCache;
 
@@ -56,11 +56,19 @@ typedef struct {
 typedef struct {
     const SGAIHeader *weights;  // Points into ROM
     SGAIKVCache *kv;            // In RDRAM
-    int16_t x[SGAI_N_EMBED];   // Current token embedding (Q8.7 fixed-point)
-    int16_t logits[SGAI_VOCAB]; // Output logits
+    float x[SGAI_N_EMBED];     // Current token embedding
+    float logits[SGAI_VOCAB];  // Output logits
+    float em_scale;             // Embedding scale factor
     uint32_t tokens[SGAI_CTX]; // Generated token sequence
     int seq_len;
     int is_loaded;
+    /* Hard-exclusion window: last 16 output tokens.
+     * penalty_hist[0] = most recent, [15] = oldest.
+     * Tokens in this window are hard-zeroed AFTER softmax — guaranteed no
+     * cycling regardless of logit magnitude. Any token seen 2+ times in
+     * the window is also zeroed (frequency cap). Only updated when temp > 0. */
+    uint8_t penalty_hist[16];
+    uint8_t penalty_n;          /* valid entries in penalty_hist (0-16) */
 } SGAIState;
 
 // API
@@ -71,7 +79,7 @@ void sgai_generate(SGAIState *state, const uint8_t *prompt, int prompt_len,
                    uint8_t *output, int max_tokens, uint32_t temperature_q8);
 
 // RSP helpers (internal)
-void sgai_rsp_matmul_q4(const uint8_t *weights, const uint16_t *scales,
+void sgai_rsp_matmul_q8(const int8_t *weights, const uint16_t *scales,
                          const int16_t *input, int16_t *output,
                          int in_dim, int out_dim);
 void sgai_softmax_inplace(int16_t *vec, int len);
